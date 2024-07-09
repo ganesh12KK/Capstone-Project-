@@ -1,0 +1,246 @@
+// Server
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <semaphore.h>
+
+#define PORT 9090
+#define MAX_CLIENTS 5
+#define SHM_NAME "/shm_random_numbers"
+#define SHM_SIZE sizeof(int)
+
+sem_t *semaphore;
+int server_fd;
+int client_count = 0;
+
+// Function to generate random numbers and store them in shared memory
+void *generate_random_numbers(void *arg) {
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(EXIT_FAILURE);
+    }
+    ftruncate(shm_fd, SHM_SIZE);
+    int *shared_memory = mmap(0, SHM_SIZE, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Shared memory ID: %d\n", shm_fd);
+
+    while (1) {
+        int random_number = rand() % 90 + 10;
+        sem_wait(semaphore);
+        *shared_memory = random_number;
+        sem_post(semaphore);
+        sleep(1);
+    }
+    return NULL;
+}
+
+// Function to handle multiple clients
+void *handle_clients(void *arg) {
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    int clients[MAX_CLIENTS];
+    int num_clients = 0;
+
+    // Continuously accept and handle clients
+    while (1) {
+        if (num_clients < MAX_CLIENTS) {
+            // Accept new client connections
+            int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+            if (new_socket < 0) {
+                perror("accept");
+                exit(EXIT_FAILURE);
+            }
+            // Store client socket in the array
+            clients[num_clients++] = new_socket;
+            client_count++;
+            printf("\nAdding client on %d\n", new_socket);
+        } else {
+            // If maximum clients reached, create a new thread to handle additional clients
+            pthread_t tid_client;
+            pthread_create(&tid_client, NULL, handle_clients, NULL);
+            num_clients = 0; // Reset the count for the new thread
+            printf("\nCreating new thread group\n");
+        }
+
+        for (int i = 0; i < num_clients; i++) {
+            // Handle client connection
+            sleep(1); // Just to simulate some work with the client
+        }
+    }
+    return NULL;
+}
+
+int main() {
+    struct sockaddr_in address;
+    int opt = 1;
+
+    // Create socket file descriptor
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Attach socket to the port
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    // Bind the socket
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Listen for incoming connections
+    if (listen(server_fd, 3) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("\nServer is listening to port: %d\n", PORT);
+
+    // Initialize semaphore
+    semaphore = sem_open("/semaphore", O_CREAT, 0644, 1);
+    if (semaphore == SEM_FAILED) {
+        perror("sem_open");
+        exit(EXIT_FAILURE);
+    }
+
+    // Create threads for generating random numbers and accepting clients
+    pthread_t tid_random, tid_client;
+    pthread_create(&tid_random, NULL, generate_random_numbers, NULL);
+    pthread_create(&tid_client, NULL, handle_clients, NULL);
+
+    pthread_join(tid_random, NULL);
+    pthread_join(tid_client, NULL);
+
+    // Cleanup
+    sem_close(semaphore);
+    sem_unlink("/semaphore");
+    shm_unlink(SHM_NAME);
+
+    return 0;
+}
+
+
+
+//  Client
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <semaphore.h>
+
+#define PORT 9090
+#define SHM_NAME "/shm_random_numbers"
+#define SHM_SIZE sizeof(int)
+
+int main() {
+    struct sockaddr_in address;
+    int sock = 0;
+    struct sockaddr_in serv_addr;
+
+    // Create socket
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("\n Socket creation error \n");
+        return -1;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+
+    // Convert IPv4 and IPv6 addresses from text to binary form
+    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+        printf("\nInvalid address/ Address not supported \n");
+        return -1;
+    }
+
+    // Connect to server
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("\nConnection Failed \n");
+        return -1;
+    }
+
+    // Open shared memory
+    int shm_fd = shm_open(SHM_NAME, O_RDONLY, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        return -1;
+    }
+
+    // Map shared memory
+    int *shared_memory = mmap(0, SHM_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        perror("mmap");
+        return -1;
+    }
+
+    // Open semaphore
+    sem_t *semaphore = sem_open("/semaphore", 0);
+    if (semaphore == SEM_FAILED) {
+        perror("sem_open");
+        return -1;
+    }
+
+    while (1) {
+        sem_wait(semaphore);
+        int random_number = *shared_memory;
+        sem_post(semaphore);
+        printf("Received Data: %d\r", random_number);
+        sleep(1);
+    }
+
+    // Cleanup
+    sem_close(semaphore);
+    munmap(shared_memory, SHM_SIZE);
+    close(shm_fd);
+    close(sock);
+
+    return 0;
+}
+
+
+// Test.sh
+
+
+#!/bin/bash
+
+# Define the number of clients to run
+num_clients=15
+
+# Loop to run clients
+for ((i=1; i<=$num_clients; i++))
+do
+    # Command to run your client, replace this with your actual client command
+    # Example: ./client_program &
+    ./cli&
+
+    # Optional: Add sleep to stagger the start of each client
+    # sleep 1
+done
+
+# Optional: Wait for all clients to finish
+wait
+
